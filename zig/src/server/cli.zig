@@ -129,7 +129,8 @@ pub const flags = [_]Flag{
     .{ .name = "--no-update-check", .kind = .store_true, .native = true },
     .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda", "rocm" }, .native = true, .native_values = backend_values },
     .{ .name = "--tp", .choices = &.{ "1", "2", "4", "8" }, .native = served("--tp") },
-    .{ .name = "--rank", .native = served("--tp") },
+    .{ .name = "--pp", .native = served("--pp") },
+    .{ .name = "--rank", .native = served("--tp") or served("--pp") },
     .{ .name = "--master", .native = served("--tp") },
     .{ .name = "--master-port", .native = served("--tp") },
     // the GPU engine's policy switches as key=value pairs, repeatable
@@ -243,6 +244,7 @@ pub const Args = struct {
     checkpoint_slots: ?i64 = null,
     spill_gib: ?f64 = null, // disk for states evicted from the prompt cache, every model together (null or 0: off)
     tp: u32 = 1,
+    pp: u32 = 1,
     rank: u32 = 0,
     master: []const u8 = "",
     master_port: u16 = 29551,
@@ -564,6 +566,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .decode_share = args.decode_share,
         .keep = args.checkpoint_slots,
         .tp = args.tp,
+        .pp = args.pp,
         .rank = args.rank,
         .master = args.master,
         .master_port = args.master_port,

@@ -28,7 +28,7 @@ const registry = cuda_families.registry;
 /// --record opens here (engines.zig refuses it for a backend without this).
 pub const records = true;
 pub const backends: []const []const u8 = &.{"cuda"};
-pub const serves: []const []const u8 = &.{ "--tp", "--mtp-drafts", "--mtp-confidence", "--policy", "--checkpoint-slots", "--spill-gib" };
+pub const serves: []const []const u8 = &.{ "--tp", "--mtp-drafts", "--mtp-confidence", "--policy", "--checkpoint-slots", "--spill-gib", "--pp" };
 pub const families = cuda_families.families;
 const gib: f64 = 1 << 30;
 const cuda_device = @import("cuda_device.zig");

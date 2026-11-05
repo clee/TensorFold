@@ -23,9 +23,11 @@ pub fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *U
     return true;
 }
 
-/// A rank names one of the `tp` processes.
+/// A rank names one of the `tp` processes, or one of the `pp` stages of one host.
 pub fn ranks(u: *Usage, a: Allocator, out: Args) error{ Usage, OutOfMemory }!void {
-    if (out.rank >= out.tp) return fail(u, a, "argument --rank: {d} is not below --tp {d}", .{ out.rank, out.tp });
+    const parts = @max(out.tp, out.pp);
+    if (out.rank >= parts) return fail(u, a, "argument --rank: {d} is not below --tp {d} or --pp {d}", .{ out.rank, out.tp, out.pp });
+    if (out.pp > 1 and out.tp != 1) return fail(u, a, "argument --pp: pipeline stages take --tp 1 (one stage a process)", .{});
 }
 
 /// The GPU engine's tensor-parallel, MTP, kept-entry and policy flags; false for any other flag.
@@ -35,7 +37,11 @@ pub fn gpuFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Us
             return std.mem.eql(u8, x, y);
         }
     }.f;
-    if (is(name, "--tp")) out.tp = @intCast(try int(u, a, name, v)) else if (is(name, "--rank")) {
+    if (is(name, "--tp")) out.tp = @intCast(try int(u, a, name, v)) else if (is(name, "--pp")) {
+        const n = try int(u, a, name, v);
+        if (n < 1 or n > 8) return fail(u, a, "argument --pp: a stage count from 1 to 8: '{s}'", .{v});
+        out.pp = @intCast(n);
+    } else if (is(name, "--rank")) {
         out.rank = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --rank: a rank from 0: '{s}'", .{v});
     } else if (is(name, "--master")) out.master = v else if (is(name, "--master-port")) {
         const p = try int(u, a, name, v);

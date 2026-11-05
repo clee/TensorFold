@@ -11,11 +11,12 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
     if (@hasField(F.Options, "lanes_fixed")) opts.lanes_fixed = o.lanes_fixed;
     if (@hasField(F.Options, "one_stream")) opts.one_stream = o.lanes == 1;
     if (@hasField(F.Options, "rank")) {
-        opts.tp = @intCast(o.tp);
+        if (@hasField(F.Options, "tp")) opts.tp = @intCast(o.tp);
         opts.rank = @intCast(o.rank);
-        opts.master = if (o.master.len > 0) o.master else null;
-        opts.master_port = o.master_port;
+        if (@hasField(F.Options, "master")) opts.master = if (o.master.len > 0) o.master else null;
+        if (@hasField(F.Options, "master_port")) opts.master_port = o.master_port;
     }
+    if (@hasField(F.Options, "pp")) opts.pp = @intCast(o.pp);
     if (comptime @hasField(F.Options, "vision")) {
         if (o.vision) |vo| {
             const own: ?u32 = comptime if (@hasDecl(F, "default_image_tokens")) F.default_image_tokens else null;

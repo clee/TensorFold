@@ -338,6 +338,8 @@ pub const Open = struct {
     keep: ?i64 = null,
     /// Tensor parallelism: this process is `rank` of `tp`; rank 0 listens on `master`:`master_port` for the others.
     tp: u32 = 1,
+    /// Pipeline parallelism (--pp): this process is `rank` of `pp` stages on one host, rank 0 the server.
+    pp: u32 = 1,
     rank: u32 = 0,
     master: []const u8 = "",
     master_port: u16 = 29551,
