@@ -29,7 +29,7 @@ pub fn release(e: anytype) void {
 
 /// The weights' bytes on the card (EXL3: a dry run of its loader, as trellis widths come from the tensors).
 fn measure(e: anytype, io: std.Io, ctx: *const cuda.Context, ck: anytype, fit: ?Fit) !usize {
-    if (!e.g.exl3) return @import("cuda_weights.zig").total(e.g);
+    if (!e.g.exl3) return @import("cuda_weights.zig").total(e.g, e.stage);
     const x3w = @import("cuda_exl3_weights.zig");
     const bytes = try x3w.measure(e, ck);
     const f = fit orelse return bytes;

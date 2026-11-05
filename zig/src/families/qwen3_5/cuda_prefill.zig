@@ -36,7 +36,7 @@ test "a pass resumes only where a cold pass cuts: every max_rows rows from 0 or 
 }
 
 pub fn run(self: anytype, stream: *lanes.Stream) !void {
-    var f = try opening(self, stream);
+    var f = if (self.pp != null) try openingPp(self, stream) else try opening(self, stream);
     defer f.deinit();
     while (!try chunk(self, stream, &f, 0)) {}
 }
@@ -45,7 +45,7 @@ pub fn run(self: anytype, stream: *lanes.Stream) !void {
 pub fn step(self: anytype, stream: *lanes.Stream, _: u32) !bool {
     const got = try self.fills.getOrPut(self.gpa, stream);
     if (!got.found_existing) {
-        got.value_ptr.* = opening(self, stream) catch |err| {
+        got.value_ptr.* = (if (self.pp != null) openingPp(self, stream) else opening(self, stream)) catch |err| {
             self.fills.removeByPtr(got.key_ptr);
             return err;
         };
@@ -133,6 +133,20 @@ fn opening(self: anytype, stream: *lanes.Stream) !Fill {
     return .{ .at = at, .media = media, .kept = if (shared) |x| .{ .gpa = self.gpa, .marks = x.plan.marks } else null };
 }
 
+/// A PP prompt begins: the one ring cache, no images, sharing or reused state.
+fn openingPp(self: anytype, stream: *lanes.Stream) !Fill {
+    const ids = stream.prompt();
+    if (ids.len == 0 or ids.len + stream.max_new > self.capacity or self.caches.contains(stream)) return error.InvalidQwenPrompt;
+    const cache = try self.take(ids.len, stream.max_new);
+    errdefer self.give(cache);
+    try self.caches.put(self.gpa, stream, cache);
+    errdefer _ = self.caches.remove(stream);
+    cache.untaught = stream.untaught;
+    stream.cached = 0;
+    stream.fill_at.store(0, .monotonic);
+    return .{ .at = 0, .media = null };
+}
+
 /// The pass's next cut; true once the prompt is in. The hint keeps the cold grid, where a cap would cut differently.
 fn chunk(self: anytype, stream: *lanes.Stream, f: *Fill, _: u32) !bool {
     const ids = stream.prompt();
@@ -144,7 +158,10 @@ fn chunk(self: anytype, stream: *lanes.Stream, f: *Fill, _: u32) !bool {
     const cache = try self.cacheOf(stream);
     var images: ?E.Images = if (f.media) |m| .{ .features = m.features.ptr, .src = m.src, .pos = m.pos } else null;
     const end = nextCut(ids.len, stream.chunks, f.at, 0);
-    try self.e.forward(&.{.{ .cache = cache, .rows = end - f.at, .images = if (images) |*im| im else null }}, ids[f.at..end], .last);
+    if (self.pp) |pp| {
+        if (images != null) return error.PipelineStageVisionUnsupported;
+        try pp.forward(self.e, ids[f.at..end], null, end == ids.len);
+    } else try self.e.forward(&.{.{ .cache = cache, .rows = end - f.at, .images = if (images) |*im| im else null }}, ids[f.at..end], .last);
     f.at = end;
     stream.fill_at.store(@intCast(end), .monotonic);
     // a mark the store asked for, where this pass cut anyway: the lane host copies the state here

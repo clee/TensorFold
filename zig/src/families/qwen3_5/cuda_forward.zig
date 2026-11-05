@@ -1,4 +1,5 @@
 //! The landed CUDA forward with optional learner taps and pocket contributions.
+const std = @import("std");
 const E = @import("cuda_engine.zig");
 const cuda = @import("cuda");
 const sig = @import("cuda_signatures.zig");
@@ -40,17 +41,25 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const group = g.q_heads / g.kv_heads;
 
     if (prompt and e.int8.on) @import("cuda_prompt_int8.zig").chunkStart(e);
-    try e.embed(t_ids, e.h, total, t_params);
+    const first = e.stage.first;
+    const end = e.stage.end();
+    if (first == 0) {
+        try e.embed(t_ids, e.h, total, t_params);
+        // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
+        if (e.features != 0) try e.run(e.fns.splice, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.features, e.tables.ptr + src_at, @as(c_int, @intCast(g.hidden)), t_params });
+    }
     // the producers of the out, o and down inputs write their group sums; a prompt GEMM past 16 rows needs none
     const sums: u64 = if (prompt and total > 16) 0 else e.xs;
-    // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
     const mpos: u64 = if (e.features != 0) e.tables.ptr + mpos_at else 0;
-    if (e.features != 0) try e.run(e.fns.splice, .{ total, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, e.features, e.tables.ptr + src_at, @as(c_int, @intCast(g.hidden)), t_params });
     var di: usize = 0;
     var ai: c_int = 0;
     // a prompt chunk keeps its last row: past the last layer's keys and values, the kept row's tile runs alone
     const tail_at: ?usize = if (prompt) @import("cuda_prompt_tail.zig").first(e, total, nseg, shape.hidden or shape.rows) else null;
-    for (e.layers, 0..) |l, i| {
+    // Non-local layer descriptors are not loaded; cache ordinals come from checkpoint geometry.
+    for (g.linear[0..first]) |linear| {
+        if (linear) di += 1 else ai += 1;
+    }
+    for (e.layers[first..end], first..) |l, i| {
         const tail = tail_at != null and i + 1 == e.layers.len;
         const t0: usize = if (tail) tail_at.? else 0;
         const rows: usize = total - t0;
@@ -140,7 +149,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         };
     }
     if (prompt and e.int8.on) @import("cuda_prompt_int8.zig").chunkEnd(e, total);
-    try finish(e, total, heads, shape.hidden, shape.rows);
+    if (e.stage.last) try finish(e, total, heads, shape.hidden, shape.rows);
 }
 
 /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
@@ -171,7 +180,6 @@ pub fn finish(e: anytype, total: usize, heads: usize, hidden: bool, rows: bool) 
 }
 
 test "prompt MoE precision: target piece arithmetic keeps the shipped 16-row boundary" {
-    const std = @import("std");
     try std.testing.expectEqual(@as(usize, 64), E.most_window);
     var mismatches: usize = 0;
     for ([_]usize{ 16, 17, 32, 64, 65 }) |rows| {
@@ -189,7 +197,6 @@ test "prompt MoE precision: target piece arithmetic keeps the shipped 16-row bou
 }
 
 test "prompt MoE precision: every prompt piece through 128 and admitted verify width keeps its recipe" {
-    const std = @import("std");
     for (1..129) |rows| try std.testing.expectEqual(rows > 16, promptMoe(true, rows));
     for (1..E.most_window + 1) |rows| try std.testing.expect(!promptMoe(false, rows));
 }

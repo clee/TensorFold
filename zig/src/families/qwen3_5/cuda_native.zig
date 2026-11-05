@@ -55,7 +55,7 @@ pub const explains_open = true;
 /// The server's reading of the room left now; null if unreadable.
 pub const Room = struct { ctx: *anyopaque, read: *const fn (*anyopaque) ?u64 };
 /// `room` and `drafter` size an EXL3 checkpoint's load: its embedding rows go to host memory when the card is short.
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, kv8: bool = false, prompt_int8: bool = false, precision: ?enum { full } = null, rope_yarn: ?f64 = null, room: ?Room = null, drafter: ?[]const u8 = null };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, kv8: bool = false, prompt_int8: bool = false, precision: ?enum { full } = null, rope_yarn: ?f64 = null, room: ?Room = null, drafter: ?[]const u8 = null, pp: usize = 1, rank: usize = 0 };
 
 /// The window --context may ask for: the config's, or the YaRN window its block or --rope-yarn makes (cuda_rope.zig).
 pub fn contextCeiling(a: std.mem.Allocator, io: std.Io, dir: []const u8, flag: ?f64) !i64 {
@@ -90,6 +90,7 @@ pub const Loaded = struct {
     engine_paged: bool = false,
     /// An integrated GPU: kept states in device memory on the host budget (Target.device), the startup line says so.
     device_snaps: bool = false,
+    follow: ?*const fn (*anyopaque) anyerror!void = null,
 };
 
 pub fn cacheBytes(e: *const E.Engine, cap: usize, test_tokens: usize) !usize {
@@ -148,7 +149,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const share_snaps = try prefix_mod.sharing();
     // a kept state sits on a cold pass's chunk cut, so later chunks keep a cold pass's bits: pages divide the chunk
     if (share_snaps > 0 and (page_tokens == 0 or E.max_rows % page_tokens != 0)) return error.QwenShareNeedsPages;
-    const e = try E.Engine.init(gpa, io, ctx, dir, o.kv8, fitOf(o));
+    if (o.pp > 1 and o.rank >= o.pp) return error.BadRank;
+    const e = if (o.pp > 1) blk: {
+        const g = try E.Geometry.read(gpa, io, dir);
+        break :blk try E.Engine.initAt(gpa, io, ctx, dir, o.kv8, fitOf(o), E.Stage.of(g.layers, o.pp, o.rank));
+    } else try E.Engine.init(gpa, io, ctx, dir, o.kv8, fitOf(o));
     errdefer e.deinit();
     if (o.rope_yarn) |f| { // --rope-yarn over the downloaded config: its table, and the window it allows
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -157,6 +162,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         e.g.context = r.ceiling;
         try @import("cuda_rope_table.zig").set(e, r.rope);
     }
+    const pp = try @import("cuda_stage_control.zig").openEngine(gpa, io, o.pp, o.rank, e, o.drafts, o.vision != null, o.slide, page_tokens > 0 or share_snaps > 0);
+    errdefer if (pp) |x| x.deinit();
     if (o.prompt_int8) try e.int8.enable(e); // --prompt-precision int8: prompt projections quantize their inputs
     if (e.g.vocab != c.vocab) return error.UnsupportedQwenVocab; // draw.zig's masks are sized by the 2B's vocabulary
     if (o.slide) _ = try @import("cuda_learn_shape.zig").from(e.g);
@@ -167,13 +174,15 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const trace = try round_timing.Trace.create(gpa, timing_on and e.g.hidden == 5120 and e.g.layers == 64 and e.g.experts == 0);
     errdefer if (trace) |x| gpa.destroy(x);
     const l = try gpa.create(Lanes);
-    l.* = .{ .gpa = gpa, .io = io, .e = e, .capacity = o.context, .page_tokens = page_tokens, .engine_paged = engine_paged, .page_test = page_test, .share_snaps = share_snaps, .cost_context = ctx, .startup = e.startup, .vision = v, .target = undefined, .timing_on = timing_on, .trace = trace };
+    l.* = .{ .gpa = gpa, .io = io, .e = e, .capacity = o.context, .page_tokens = page_tokens, .engine_paged = engine_paged, .page_test = page_test, .share_snaps = share_snaps, .cost_context = ctx, .startup = e.startup, .vision = v, .target = undefined, .timing_on = timing_on, .trace = trace, .pp = pp };
     l.target = .{ .e = e, .caches = &l.caches, .seen = &l.seen, .device = try ctx.attribute(.integrated) != 0 };
+    var facts = modelFacts(@intCast(e.window_rows), @intCast(e.verify_rows), e.g);
+    if (pp != null) facts.max_streams = 1;
     return .{
         .learns = if (o.slide) e else null,
         .learn_bytes = if (o.slide) @import("cuda_train.zig").memory(try @import("cuda_learn_shape.zig").from(e.g)) + e.streamBytes(o.context) else 0,
         .backend = l.backend(),
-        .facts = modelFacts(@intCast(e.window_rows), @intCast(e.verify_rows), e.g),
+        .facts = facts,
         .rows = @intCast(e.window_rows),
         .stream_bytes = try cacheBytes(e, o.context, page_test),
         .ctx = l,
@@ -182,6 +191,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .vision = v,
         .target = &l.target,
         .device_snaps = l.target.device,
+        .follow = if (pp != null and o.rank != 0) followPp else null,
         .layout = if (page_tokens > 0) pages_mod.layout(e, o.context, page_tokens, 0, 0) else null,
         .own_prompt_cache = share_snaps > 0,
         .all_on_pages = page_tokens > 0 and share_snaps > 0 and !engine_paged, // the engine's window idle
@@ -201,6 +211,13 @@ pub fn learnModel(p: *anyopaque, dir: []const u8) slide.Model {
     return .{ .e = l.e, .dir = dir, .lay = slide.layout(l.e.g.hidden, l.e.g.layers, l.e.g.intermediate, 0) catch unreachable };
 }
 
+/// One stage's weight bytes for admission: only its layers plus the embedding on rank 0 and the head on the last.
+pub fn placementStageBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, parts: usize, rank: usize) !u64 {
+    const g = try E.Geometry.read(gpa, io, dir);
+    const st = E.Stage.of(g.layers, parts, rank);
+    return @import("cuda_weights.zig").total(g, st);
+}
+
 /// A checkpoint's facts: the dense 27B also copies from the root (DFlash2 raises its copy match, draft.copyMatch).
 pub fn modelFacts(window: u32, verify: u32, g: anytype) lanes.Model {
     var facts = laneFacts(window, verify);
@@ -215,11 +232,18 @@ pub fn laneFacts(window: u32, verify: u32) lanes.Model {
 
 fn reserve(p: *anyopaque, streams: u32) anyerror!void {
     const l: *Lanes = @ptrCast(@alignCast(p));
+    if (l.pp != null) return; // one ring cache, opened with the stream
     try reservation.target(E.Cache, E.Part, l, streams); // with a pool: the first window, the shapes on its lanes
 }
 const drafter_open = @import("cuda_drafter_open.zig");
 pub const Opened = drafter_open.Opened;
 pub const openDrafter = drafter_open.openDrafter;
+
+fn followPp(ptr: *anyopaque) anyerror!void {
+    const l: *Lanes = @ptrCast(@alignCast(ptr));
+    const p = l.pp orelse return error.PipelineStageNotWired;
+    return p.follow(l.e);
+}
 
 /// A request this engine refuses, in words, or with no engine (null) its open; null: none of its own.
 pub fn explain(ctx: ?*anyopaque, err: anyerror) ?[]const u8 {
@@ -294,7 +318,7 @@ pub const Lanes = struct {
     calibration: ?*Draft = null,
     /// Prompt passes going a cut at a time (prefill_step), from their first step to their last.
     fills: std.AutoHashMapUnmanaged(*lanes.Stream, Fill) = .empty,
-
+    pp: ?*@import("cuda_stage_control.zig").Pp = null,
     fn deinit(self: *Lanes) void {
         var it = self.caches.valueIterator();
         while (it.next()) |cache| self.give(cache.*); // a pool lane's pages back, a window to the reserve
@@ -310,11 +334,11 @@ pub const Lanes = struct {
         if (self.prefix) |x| x.deinit(); // its pages back to the pool before the pool goes
         if (self.pages) |p| p.deinit();
         if (self.vision) |v| v.deinit();
+        if (self.pp) |p| p.deinit();
         self.e.deinit();
         if (self.trace) |x| self.gpa.destroy(x);
         self.gpa.destroy(self);
     }
-
     fn drop(self: *Lanes, cache: *E.Cache) void {
         if (cache.owner != null) {
             cuda.completion.drain(self.e.d, self.e.stream, "recurrent cache disposal did not drain");
@@ -326,6 +350,11 @@ pub const Lanes = struct {
 
     /// A cache for a new stream: a pooled one reset, a pool lane with its pages, else one more window.
     pub fn take(self: *Lanes, prompt: usize, max_new: usize) !*E.Cache {
+        if (self.pp) |p| {
+            if (self.caches.count() != 0) return error.PipelineStageOneStream;
+            try p.openStream(self.e, @min(self.capacity, prompt + max_new + 1));
+            return p.cache orelse error.PipelineStageNoSequence;
+        }
         if (!self.paged_only) if (self.pool.pop()) |cache| {
             try cache.reset(self.e);
             return cache;
@@ -336,8 +365,11 @@ pub const Lanes = struct {
         cache.* = try E.Cache.init(self.gpa, self.e, self.capacity);
         return cache;
     }
-
     pub fn give(self: *Lanes, cache: *E.Cache) void {
+        if (self.pp) |p| {
+            p.closeStream() catch {};
+            return;
+        }
         if (self.pages) |p| if (p.close(cache)) return;
         if (cache.owner != null) {
             cache.last = null;
@@ -351,7 +383,6 @@ pub const Lanes = struct {
     pub fn timeWindows(self: *Lanes, d: anytype, reserved: ?*E.Cache) !void {
         self.startup.add(try cost_adapter.measure(self, d, reserved));
     }
-
     fn backend(self: *Lanes) be.Backend {
         return .{ .ptr = self, .round_observer = if (self.trace) |x| x.observer() else null, .first_before_draft = true, .penalties = true, .vtable = &.{ .prefill = prefillFn, .prefill_step = prefillStepFn, .cancel_prefill = cancelPrefillFn, .reports_fill = true, .first = firstFn, .first_masked = firstMaskedFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .prepare_features = prepareFeaturesFn, .features = featuresFn, .release = releaseFn } };
     }
@@ -368,11 +399,9 @@ pub const Lanes = struct {
         const cache = self.caches.get(stream) orelse return null;
         return cache.drafter_ring;
     }
-
     fn cast(ptr: *anyopaque) *Lanes {
         return @ptrCast(@alignCast(ptr));
     }
-
     pub fn cacheOf(self: *Lanes, stream: *lanes.Stream) !*E.Cache {
         return self.caches.get(stream) orelse error.UnknownQwenStream;
     }
@@ -433,6 +462,10 @@ pub const Lanes = struct {
         defer if (self.timing_on) @import("cuda_draft.zig").timing("verify", self.io, t0);
         if (self.trace) |x| x.reset();
         if (windows.len != out.len) return error.InvalidQwenWindows;
+        if (self.pp) |pp| {
+            if (windows.len != 1) return error.PipelineStageRoundsUnsupported;
+            return @import("cuda_stage_control.zig").verifyOne(pp, self.e, try self.cacheOf(windows[0].stream), self.gpa, windows[0], &out[0]);
+        }
         for (windows, out) |w, o| {
             const rows = w.rows();
             if (w.held != 0 or rows > self.e.window_rows or w.positions.len != rows) return error.UnsupportedQwenWindow;

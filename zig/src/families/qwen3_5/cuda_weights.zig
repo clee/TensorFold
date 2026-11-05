@@ -20,6 +20,7 @@ const A3 = cuda.experts3.Affine3Experts;
 const DeviceBuffer = cuda.DeviceBuffer;
 const aligned = engine.aligned;
 const head_dim = geometry.head_dim;
+const Stage = @import("cuda_stage.zig").Stage;
 
 /// The packed tiles' bytes of an n-by-k projection of `bits` codes (qlinear's words, scales and biases).
 pub fn packedBytes(n: usize, k: usize, bits: u8) usize {
@@ -79,12 +80,15 @@ fn raw3Bytes(count: usize, n: usize, k: usize) usize {
 }
 
 /// What `load` takes from the arena: every packed projection and vector, each allocation aligned.
-pub fn total(g: Geometry) usize {
+pub fn total(g: Geometry, st: Stage) usize {
     const mo = g.kinds.modelopt;
-    var t: usize = if (mo) aligned(g.vocab * g.hidden * 2) else embedBytes(g);
-    t += if (mo) modelopt.packedBytes(g.vocab, g.hidden, g.kinds.head) else packedBytes(g.vocab, g.hidden, g.bits.head); // the head
-    t += aligned(g.hidden * 2);
-    for (0..g.layers) |i| {
+    var t: usize = 0;
+    if (st.first == 0) t += if (mo) aligned(g.vocab * g.hidden * 2) else embedBytes(g);
+    if (st.last) {
+        t += if (mo) modelopt.packedBytes(g.vocab, g.hidden, g.kinds.head) else packedBytes(g.vocab, g.hidden, g.bits.head); // the head
+        t += aligned(g.hidden * 2); // the final norm
+    }
+    for (st.first..st.end()) |i| {
         t += 2 * aligned(g.hidden * 2);
         if (g.moe()) t += if (mo) modelopt_experts.routedBytes(g) else routedBytes(g.experts, g.intermediate, g.hidden, g.expert_bits);
         for (slots(g, i)) |slot| {
@@ -333,41 +337,45 @@ fn embedWords(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer, m: []const
     return out;
 }
 
-pub fn load(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer) !void {
+pub fn load(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer, st: Stage) !void {
     const g = e.g;
     const mo = g.kinds.modelopt;
     const m = if (mo) modelopt.prefix else "language_model.model.";
-    if (mo) {
-        e.embed_bits = 16; // bf16 rows as stored
-        e.embed_w = try tensor(e, ck, "{s}embed_tokens.weight", .{m}, .bf16, &.{ g.vocab, g.hidden });
-        e.embed_s = 0;
-        e.embed_b = 0;
-        e.head = try modelopt.linear(e, ck, stage, "", "lm_head", g.vocab, g.hidden, g.kinds.head);
-    } else {
-        e.embed_bits = rowBits(g.bits.embed);
-        e.embed_w = try embedWords(e, ck, stage, m);
-        e.embed_s = try tensor(e, ck, "{s}embed_tokens.scales", .{m}, .bf16, &.{ g.vocab, g.hidden / 64 });
-        e.embed_b = try tensor(e, ck, "{s}embed_tokens.biases", .{m}, .bf16, &.{ g.vocab, g.hidden / 64 });
-        e.head = if (g.tied) try linear(e, e, ck, stage, m, "embed_tokens", g.vocab, g.hidden, g.bits.head) else try linear(e, e, ck, stage, "language_model.", "lm_head", g.vocab, g.hidden, g.bits.head);
+    if (st.first == 0) {
+        if (mo) {
+            e.embed_bits = 16; // bf16 rows as stored
+            e.embed_w = try tensor(e, ck, "{s}embed_tokens.weight", .{m}, .bf16, &.{ g.vocab, g.hidden });
+            e.embed_s = 0;
+            e.embed_b = 0;
+        } else {
+            e.embed_bits = rowBits(g.bits.embed);
+            e.embed_w = try embedWords(e, ck, stage, m);
+            e.embed_s = try tensor(e, ck, "{s}embed_tokens.scales", .{m}, .bf16, &.{ g.vocab, g.hidden / 64 });
+            e.embed_b = try tensor(e, ck, "{s}embed_tokens.biases", .{m}, .bf16, &.{ g.vocab, g.hidden / 64 });
+        }
     }
     // a plain BF16 checkpoint keeps HF's raw w: its norm kernels (the _shift ones) scale by 1 + w in FP32
     const shift = mo and !g.bf16;
-    e.final_norm = try normVec(e, ck, shift, "{s}norm.weight", .{m}, .bf16, &.{g.hidden});
+    if (st.last) {
+        e.head = if (mo) try modelopt.linear(e, ck, stage, "", "lm_head", g.vocab, g.hidden, g.kinds.head) else if (g.tied) try linear(e, e, ck, stage, m, "embed_tokens", g.vocab, g.hidden, g.bits.head) else try linear(e, e, ck, stage, "language_model.", "lm_head", g.vocab, g.hidden, g.bits.head);
+        e.final_norm = try normVec(e, ck, shift, "{s}norm.weight", .{m}, .bf16, &.{g.hidden});
+    }
     const conv = g.convWidth();
     const taps_shape: []const usize = if (mo) &.{ conv, 1, geometry.taps } else &.{ conv, geometry.taps, 1 }; // the same bytes
     const readers = try core.checkpoint.loadReaders();
     // each layer read past the page cache, the next one while it packs (TF_LOAD_DIRECT=0: #1928's read-ahead)
     var direct = core.checkpoint.direct.Layers.init(e.gpa, ck, readers);
     defer direct.deinit();
-    for (e.layers, 0..) |*l, i| {
+    for (e.layers[st.first..st.end()], st.first..) |*l, i| {
         var pbuf: [2][96]u8 = undefined;
         const p = try std.fmt.bufPrint(&pbuf[0], "{s}layers.{d}.", .{ m, i });
-        const last = i + 1 == e.layers.len;
+        const last = i + 1 == st.end(); // a stage reads ahead within its own slice
         try direct.enter(p, if (last) null else try std.fmt.bufPrint(&pbuf[1], "{s}layers.{d}.", .{ m, i + 1 }));
         // a read-ahead layer is on the device: its pages leave the cache (none: main's one release at close)
         defer if (readers > 0 and !direct.on()) ck.release();
         // read ahead by threads of their own while the layer packs
         var reading: core.checkpoint.Ahead = if (direct.on()) .{} else ck.prefetch(p, readers);
+        defer _ = reading.join();
         defer _ = reading.join();
         var ps: std.enums.EnumArray(Slot, Proj) = .initUndefined();
         for (slots(g, i)) |slot| {
@@ -411,18 +419,19 @@ test "a uniform 4-bit checkpoint keeps its sizes; other modules take their own w
     var g: Geometry = undefined;
     g = .{ .hidden = 2048, .intermediate = 6144, .layers = 2, .vocab = 248320, .k_heads = 16, .v_heads = 16, .q_heads = 8, .kv_heads = 2, .eps = 1e-6, .tied = true, .context = 4096, .linear = @splat(false) };
     g.linear[0] = true;
-    const uniform = total(g);
+    const whole = Stage.whole(g.layers);
+    const uniform = total(g, whole);
     try std.testing.expectEqual(rawBytes(g.vocab, g.hidden, 4), stageBytes(g));
     g.bits.proj[1][@backingInt(Slot.down)] = 8;
     const nk = shape(g, .down);
-    try std.testing.expectEqual(uniform - packedBytes(nk[0], nk[1], 4) + packedBytes(nk[0], nk[1], 8), total(g));
+    try std.testing.expectEqual(uniform - packedBytes(nk[0], nk[1], 4) + packedBytes(nk[0], nk[1], 8), total(g, whole));
     g.bits.proj[1][@backingInt(Slot.down)] = 3; // on 3-bit tiles: 3 bits a weight
-    try std.testing.expectEqual(uniform - packedBytes(nk[0], nk[1], 4) + packedBytes(nk[0], nk[1], 3), total(g));
+    try std.testing.expectEqual(uniform - packedBytes(nk[0], nk[1], 4) + packedBytes(nk[0], nk[1], 3), total(g, whole));
     try std.testing.expect(packedBytes(nk[0], nk[1], 3) < packedBytes(nk[0], nk[1], 4));
     g.bits.proj[1][@backingInt(Slot.down)] = 4;
     g.bits.embed = 6;
     g.bits.head = 6;
-    try std.testing.expect(total(g) > uniform);
+    try std.testing.expect(total(g, whole) > uniform);
     try std.testing.expectEqual(rawBytes(g.vocab, g.hidden, 6), stageBytes(g));
 }
 

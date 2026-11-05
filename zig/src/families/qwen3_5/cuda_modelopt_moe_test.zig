@@ -2,6 +2,7 @@
 const std = @import("std");
 const geometry = @import("cuda_geometry.zig");
 const weights = @import("cuda_weights.zig");
+const Stage = @import("cuda_stage.zig").Stage;
 const experts = @import("cuda_modelopt_experts.zig");
 const Kind = geometry.Kind;
 const a = std.testing.allocator;
@@ -52,7 +53,7 @@ test "nvidia/Qwen3.6-35B-A3B-NVFP4's recipes: W4A16 experts and shared expert, F
     try std.testing.expectEqual(Kind.fp8, g.kinds.of(3, .o));
     try std.testing.expectEqual(Kind.affine, g.kinds.of(0, .gate)); // a MoE layer has no dense MLP
     try std.testing.expectEqual(@as(u8, 16), g.bits.embed);
-    try std.testing.expect(weights.total(g) > g.layers * experts.routedBytes(g));
+    try std.testing.expect(weights.total(g, Stage.whole(g.layers)) > g.layers * experts.routedBytes(g));
     try std.testing.expect(weights.stageBytes(g) >= experts.stageBytes(g));
 }
 

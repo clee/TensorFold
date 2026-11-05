@@ -59,7 +59,45 @@ that length. `--context` controls request admission; KV buffers are sized for ea
 | Pinned affine 4-bit/group-64 checkpoint, M5 Max, macOS 27 | Native operation, forward, cache and server checks exercised; see the contribution's receipt for results and outstanding checks. |
 | M1, M2, M3, M4 | Untested for this model. Uses simdgroup matrix kernels without M5 tensor units; the local load check does not replace full hardware qualification. |
 | M5 on other macOS / runtime versions | Untested. Rerun the operation, fidelity and exactness checks. |
-| CUDA, non-Apple platforms | No native Qwen3.5-2B backend in this contribution. |
+| CUDA, non-Apple platforms | The native CUDA engine serves this checkpoint; see [CUDA pipeline parallel](#cuda-pipeline-parallel). |
+
+## CUDA pipeline parallel
+
+The CUDA engine can split the 2B over one host's GPUs: `--pp N --rank R --device R` gives each process one
+contiguous slice of the 24 layers, rank 0 serves, and the last rank runs the final norm and the head. The
+ranks exchange each pass over the fabric stage ring (`zig/src/fabric/stage`), which needs:
+
+| Setting | Meaning |
+| --- | --- |
+| `TF_STAGE_RANK`, `TF_STAGE_WORLD` | This process's rank and the stage count; they must match `--rank` and `--pp`. |
+| `TF_STAGE_PEERS` | Every rank's own `HOST:PORT`, in rank order, comma separated; a rank listens on its entry only. |
+| `TF_STAGE_SECRET_FILE` | An owner-only file (16 bytes to 4 KiB) whose key every rank proves to its neighbours. |
+| `TF_STAGE_TIMEOUT_S` | How long ring formation and each later send may take; default 60. |
+
+The ring refuses a neighbour on another world, checkpoint geometry or key before any frame, and a round
+carries the tokens, the stage's hidden rows and the last stage's logits. Pass `--no-drafts`; `--pp` refuses
+drafts, vision, `--slide`, KV pages, prompt sharing, `--tp` and more than one stream.
+
+Every rank, including the last, loads only its own layer slice plus the pieces it runs (the embedding on
+rank 0, and the tied head and final norm on the last). On two ranks rank 0 read 1.15 GiB instead of 1.78 GiB.
+Global DeltaNet and attention cache ordinals come from the checkpoint geometry, not the unloaded non-local
+layer descriptors.
+
+Two processes on one host, both given the same peers and key:
+
+```sh
+echo 'local stage ring' > /tmp/qwen35-stage.key && chmod 600 /tmp/qwen35-stage.key
+TF_STAGE_PEERS=127.0.0.1:7110,127.0.0.1:7111 TF_STAGE_SECRET_FILE=/tmp/qwen35-stage.key \
+TF_STAGE_RANK=0 TF_STAGE_WORLD=2 ./tensorfold-native serve --pp 2 --rank 0 --device 0 --no-drafts
+TF_STAGE_PEERS=127.0.0.1:7110,127.0.0.1:7111 TF_STAGE_SECRET_FILE=/tmp/qwen35-stage.key \
+TF_STAGE_RANK=1 TF_STAGE_WORLD=2 ./tensorfold-native serve --pp 2 --rank 1 --device 1 --no-drafts
+```
+
+`tf-cuda-test qwen35-pp MODEL IDS.json 2` (or `4`) builds the ring in one process over loopback ports and
+runs the prompt and one decode row through the stages, comparing both rows with one card byte for byte. On
+5 Nov 2026, ReleaseSafe runs with two- and four-token fixtures passed at both 2 and 4 ranks on CMP 170HX
+cards; optimized two-token/2-rank and four-token/4-rank runs also passed. A two-process, two-rank server with
+`--no-drafts --no-thinking` answered `Hello`, and the one-card server answered the same.
 | Other checkpoints, model sizes, quantizations, vision / video | Outside the qualified scope. |
 
 The preview's unresolved M1–M4 exactness qualification for existing families remains in force.

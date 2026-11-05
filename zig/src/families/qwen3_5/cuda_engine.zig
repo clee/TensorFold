@@ -14,9 +14,9 @@ const modelopt = @import("cuda_modelopt.zig");
 const x3w = @import("cuda_exl3_weights.zig");
 const hosted = @import("cuda_host_embed.zig");
 pub const recurrent = @import("cuda_recurrent.zig");
-
 pub const Geometry = geometry.Geometry;
 pub const Cache = caches.Cache;
+pub const Stage = @import("cuda_stage.zig").Stage;
 pub const tap_rows = caches.tap_rows;
 const Seg = caches.Seg;
 const DeviceBuffer = cuda.DeviceBuffer;
@@ -67,6 +67,8 @@ pub const Keep = union(enum) {
     logits,
     hidden,
     rows,
+    /// A pipeline stage's pass: `true` records it as a verify window, `false` keeps nothing.
+    stage: bool,
 
     /// Whether the forward is a verify window (recorded, one-row bits); `last` and `rows` are prompt chunks.
     pub fn verifies(k: Keep) bool {
@@ -88,6 +90,7 @@ pub const Engine = struct {
     taught: u64 = 0,
     d: *const cuda.Driver,
     g: Geometry,
+    stage: Stage = .{}, // this process's PP layer slice; whole on one card
     geo: Geo,
     stream: cuda.Stream,
     mods: [19]cuda.Module,
@@ -170,7 +173,6 @@ pub const Engine = struct {
     n_taps: usize = 0,
     /// During an image prompt chunk's forward: its feature rows (0: none); the chunk's src and positions are staged.
     features: u64 = 0,
-
     pub const ids_at = Round.ids_at;
     pub const segs_at = Round.segs_at;
     pub const rowseg_at = Round.rowseg_at;
@@ -183,11 +185,14 @@ pub const Engine = struct {
     pub const src_at = Round.src_at;
     pub const mpos_at = Round.mpos_at;
     const tables_len = Round.bytes;
-
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kv8: bool, fit: ?hosted.Fit) !*Engine {
+        return initAt(gpa, io, ctx, dir, kv8, fit, null);
+    }
+    pub fn initAt(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kv8: bool, fit: ?hosted.Fit, stage: ?Stage) !*Engine {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         const started = profile.now(io);
         const g = try Geometry.read(gpa, io, dir);
+        const st = stage orelse Stage.whole(g.layers);
         const d = ctx.d;
         const e = try @import("cuda_prompt_int8.zig").Allocation(Engine).create(gpa);
         errdefer gpa.destroy(e);
@@ -203,6 +208,7 @@ pub const Engine = struct {
         e.kit = null;
         e.d = d;
         e.g = g;
+        e.stage = st;
         e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };
         e.verify_rows = most_verify;
         e.kv8 = kv8;
@@ -268,18 +274,18 @@ pub const Engine = struct {
             try x3w.load(e, &ck);
         } else {
             // each projection as stored, packed from here; freed before the server counts what streams can use
-            var stage = try DeviceBuffer.alloc(d, weights.stageBytes(g));
-            defer stage.free();
-            try weights.load(e, &ck, &stage);
+            var pack = try DeviceBuffer.alloc(d, weights.stageBytes(g));
+            defer pack.free();
+            try weights.load(e, &ck, &pack, st);
         }
         if (e.mo) |*m| try m.reserveParts(e);
         try @import("cuda_engine_tail.zig").finish(e, io, started);
         return e;
     }
-
     pub fn finishWarm(e: *Engine, io: std.Io, started: i96) !void {
         const warm_start = profile.now(io);
         e.startup = .{ .load = warm_start - started };
+        if (e.stage.first != 0 or e.stage.count != e.g.layers) return;
         errdefer recurrent.shutdown(e);
         e.startup.add(try profile.withCache(e.gpa, io, e, Cache));
     }
@@ -297,7 +303,6 @@ pub const Engine = struct {
         try e.stream.synchronize();
         recurrent.completed(e);
     }
-
     pub fn deinit(e: *Engine) void {
         recurrent.shutdown(e);
         @import("cuda_rope_table.zig").free(e);
@@ -350,7 +355,6 @@ pub const Engine = struct {
 
     /// The scratch rows' bytes, or the rows themselves from the arena (cuda_scratch.zig).
     pub const scratch = @import("cuda_scratch.zig").scratch;
-
     pub fn run(e: *Engine, f: cuda.Function, grid: [3]usize, block: [3]usize, args: anytype) !void {
         var a: cuda.Args = .{};
         inline for (args) |v| a.add(v);
@@ -385,7 +389,6 @@ pub const Engine = struct {
         try e.run(e.fns.argmax_slices, .{ slices, n, 1 }, .{ 256, 1, 1 }, .{ e.logits + first * e.g.vocab * 2, @as(c_int, @intCast(e.g.vocab)), pv, pi });
         try e.run(e.fns.argmax_merge, .{ n, 1, 1 }, .{ 32, 1, 1 }, .{ pv, pi, @as(c_int, @intCast(slices)), toks + first * 4 });
     }
-
     pub fn norm(e: *Engine, residual: bool, w: u64, rows: usize) !void {
         try e.run(if (e.g.bf16) e.fns.norm_shift else e.fns.norm, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ e.h, if (residual) e.r else @as(u64, 0), w, e.x, e.g.eps, @as(c_int, @intCast(e.g.hidden)), e.tables.ptr + params_at, e.xs });
     }
@@ -405,7 +408,10 @@ pub const Engine = struct {
         if (parts.len == 0 or parts.len > max_segs or total != ids.len or total > max_rows) return error.InvalidQwenSegments;
         if (e.learning != null and total != 1) return error.BadLearningRows;
         if (keep == .hidden and e.learning == null) return error.BadLearningRows;
-        const record = keep.verifies();
+        const record = switch (keep) {
+            .stage => |r| r,
+            else => keep.verifies(),
+        };
         if (record and total > e.verify_rows) return error.InvalidQwenSegments;
         if (!record and parts.len != 1) return error.InvalidQwenSegments;
         if (keep == .draws and keep.draws.len != total) return error.InvalidQwenSegments;
@@ -419,7 +425,10 @@ pub const Engine = struct {
         try e.admit(parts, ids, keep);
         const g = e.g;
         const total = ids.len;
-        const record = keep.verifies();
+        const record = switch (keep) {
+            .stage => |r| r,
+            else => keep.verifies(),
+        };
         const heads: usize = if (record) total else 1;
         // the prompt GEMM only for prompt chunks: a window's rows keep the bits of one-row steps
         const prompt = !record;
@@ -508,6 +517,7 @@ pub const Engine = struct {
         if (keep == .draws or keep == .logits) try e.penalties.apply(e.d, &e.draws, e.stream, e.logits, g.vocab) else e.penalties.clear();
         switch (keep) {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
+            .stage => try e.stream.synchronize(), // this stage's h and r are ready for the ring
             .draws => |pk| {
                 const toks = e.tables.ptr + tokens_at;
                 var i: usize = 0; // runs of greedy rows argmaxed together, runs of sampled rows drawn together

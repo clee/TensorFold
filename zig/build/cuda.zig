@@ -41,6 +41,7 @@ pub fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     qwen35.addImport("engine_api", b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} })); // core's prompt-cache types, the server's engine_api
     const qwen_vision = qwenVisionModule(b, target, optimize, cuda, core, lanes);
     qwen35.addImport("qwen_vision", qwen_vision);
+    qwen35.addImport("stage", @import("stage.zig").module(b, target, optimize)); // pipeline parallel's ring, the fabric stage link
     return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .qwen35 = qwen35, .qwen_vision = qwen_vision, .tokenizer = tokenizer, .heat = heat, .radio = radio, .living = living, .api = qwen35.import_table.get("engine_api").? };
 }
 
